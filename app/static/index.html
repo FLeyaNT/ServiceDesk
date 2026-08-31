@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Service Desk — Техподдержка</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+        .modal-backdrop { background-color: rgba(0,0,0,0.5); backdrop-filter: blur(3px); }
+        .ticket-item { transition: transform 0.15s, box-shadow 0.15s; cursor: pointer; margin-bottom: 16px; }
+        .ticket-item:last-child { margin-bottom: 0; }
+        .ticket-item:hover { transform: translateY(-3px); box-shadow: 0 12px 20px -12px rgba(0,0,0,0.2); }
+        body.modal-open { overflow: hidden; }
+        .counter-badge { animation: pulse 1s infinite; }
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
+        .online-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background-color: #10b981; box-shadow: 0 0 4px #10b981; margin-left: 8px; animation: pulse 2s infinite; }
+        .tickets-list-container { display: flex; flex-direction: column; gap: 16px; }
+        .edit-field-group { margin-bottom: 1rem; }
+        .edit-field-group label { font-weight: 600; margin-bottom: 0.25rem; display: block; }
+        .edit-field-group input, .edit-field-group select, .edit-field-group textarea { width: 100%; border: 1px solid #cbd5e1; border-radius: 0.5rem; padding: 0.5rem; }
+        /* Фикс для чекбокса – не растягивать на всю ширину */
+        .edit-field-group input[type="checkbox"] {
+            width: auto;
+            margin-right: 0.5rem;
+        }
+        .inv-info { margin-top: 0.5rem; font-size: 0.875rem; }
+        .inv-info-success { color: #166534; background-color: #dcfce7; padding: 0.5rem; border-radius: 0.5rem; }
+        .inv-info-error { color: #991b1b; background-color: #fee2e2; padding: 0.5rem; border-radius: 0.5rem; }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans antialiased">
+
+<div class="container mx-auto px-4 py-8 max-w-7xl">
+    <div id="auth-section" class="bg-white rounded-2xl shadow-xl p-6 max-w-4xl mx-auto"></div>
+    <div id="app-content" class="hidden">
+        <div class="flex flex-wrap justify-between items-center gap-4 mb-6 bg-white p-4 rounded-xl shadow-sm">
+            <div class="flex items-center gap-3"><i class="fas fa-headset text-3xl text-blue-600"></i><h1 class="text-2xl font-bold text-gray-800">Service Desk</h1></div>
+            <div class="flex items-center gap-4">
+                <div id="user-info" class="text-gray-700 font-medium"></div>
+                <button id="logout-btn" class="bg-gray-200 hover:bg-gray-300 text-gray-800 px-4 py-2 rounded-full transition flex items-center gap-2"><i class="fas fa-sign-out-alt"></i> Выйти</button>
+                <button id="register-user-btn" class="hidden bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-full transition flex items-center gap-2"><i class="fas fa-user-plus"></i> Регистрация</button>
+            </div>
+        </div>
+        <div id="nav-tabs" class="flex flex-wrap gap-2 mb-6 border-b border-gray-200 pb-2"></div>
+        <div id="page-content"></div>
+    </div>
+</div>
+
+<script>
+    const API_BASE = '/api';
+    let currentUser = null;
+    let ws = null;
+    let reconnectTimeout = null;
+    let currentPageHandler = null;
+
+    async function apiCall(endpoint, options = {}) {
+        const url = endpoint.startsWith('http') ? endpoint : `${API_BASE}${endpoint}`;
+        const response = await fetch(url, { ...options, credentials: 'include', headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
+        if (!response.ok) {
+            let errorMsg = `Ошибка ${response.status}`;
+            try { const data = await response.json(); errorMsg = data.detail || errorMsg; } catch(e) {}
+            throw new Error(errorMsg);
+        }
+        if (response.status === 204) return null;
+        return await response.json();
+    }
+
+    async function fetchNewTicketsCount() {
+        if (!currentUser || (currentUser.role !== 'technician' && currentUser.role !== 'superuser')) return null;
+        try {
+            const tickets = await apiCall('/tickets/new');
+            const count = tickets.length;
+            updateNewTicketsCounter(count);
+            return count;
+        } catch(e) { console.error('Failed to fetch new tickets count:', e); return null; }
+    }
+
+    function connectWebSocket() {
+        if (!currentUser || (currentUser.role !== 'technician' && currentUser.role !== 'superuser')) return;
+        if (ws && ws.readyState === WebSocket.OPEN) return;
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/api/ws/new-tickets`;
+        try {
+            ws = new WebSocket(wsUrl);
+            ws.onopen = () => {
+                const newTabBtn = document.querySelector('.tab-btn[data-tab="new"]');
+                if (newTabBtn && !newTabBtn.querySelector('.online-dot')) { const dot = document.createElement('span'); dot.className = 'online-dot'; dot.title = 'Real-time updates active'; newTabBtn.appendChild(dot); }
+                if (ws.heartbeatInterval) clearInterval(ws.heartbeatInterval);
+                ws.heartbeatInterval = setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping'); }, 30000);
+            };
+            ws.onmessage = (event) => {
+                try { const data = JSON.parse(event.data); if (data.event === 'new_tickets_count') { updateNewTicketsCounter(data.count); if (currentPageHandler === 'new') renderNewTickets(); } } catch(e) { console.error(e); }
+            };
+            ws.onclose = () => {
+                if (ws && ws.heartbeatInterval) clearInterval(ws.heartbeatInterval);
+                const newTabBtn = document.querySelector('.tab-btn[data-tab="new"]');
+                if (newTabBtn) { const dot = newTabBtn.querySelector('.online-dot'); if (dot) dot.remove(); }
+                if (reconnectTimeout) clearTimeout(reconnectTimeout);
+                reconnectTimeout = setTimeout(connectWebSocket, 5000);
+            };
+            ws.onerror = (error) => { ws.close(); };
+        } catch(e) { console.error('WebSocket creation error:', e); }
+    }
+
+    function disconnectWebSocket() { if (ws) { if (ws.heartbeatInterval) clearInterval(ws.heartbeatInterval); ws.close(); ws = null; } if (reconnectTimeout) clearTimeout(reconnectTimeout); }
+
+    function updateNewTicketsCounter(count) {
+        const newTabBtn = document.querySelector('.tab-btn[data-tab="new"]');
+        if (!newTabBtn) return;
+        const existingBadge = newTabBtn.querySelector('.counter-badge');
+        if (existingBadge) existingBadge.remove();
+        if (count > 0) { const badge = document.createElement('span'); badge.className = 'counter-badge ml-2 bg-red-500 text-white text-xs px-2 py-0.5 rounded-full'; badge.textContent = count > 99 ? '99+' : count; newTabBtn.appendChild(badge); }
+    }
+
+    function showRegisterModal() {
+        const modalDiv = document.createElement('div');
+        modalDiv.className = 'fixed inset-0 z-50 flex items-center justify-center modal-backdrop';
+        modalDiv.innerHTML = `<div class="bg-white rounded-2xl w-full max-w-md mx-4 shadow-2xl"><div class="border-b px-6 py-4 flex justify-between items-center"><h3 class="text-lg font-bold"><i class="fas fa-user-plus"></i> Регистрация нового пользователя</h3><button class="close-modal text-gray-500 hover:text-gray-800 text-2xl">&times;</button></div><div class="p-6 space-y-4"><div><label class="block font-medium mb-1">Полное имя *</label><input type="text" id="reg-fullname" class="w-full border rounded-lg p-2"></div><div><label class="block font-medium mb-1">Логин (3-100) *</label><input type="text" id="reg-username" class="w-full border rounded-lg p-2"></div><div><label class="block font-medium mb-1">Пароль (≥8) *</label><input type="password" id="reg-password" class="w-full border rounded-lg p-2"></div><div><label class="block font-medium mb-1">Роль *</label><select id="reg-role" class="w-full border rounded-lg p-2"><option value="employee">Сотрудник</option><option value="technician">Техник</option><option value="superuser">Суперпользователь</option></select></div></div><div class="border-t p-4 flex justify-end gap-3"><button id="cancel-register" class="px-4 py-2 bg-gray-200 rounded-lg">Отмена</button><button id="submit-register" class="px-4 py-2 bg-blue-600 text-white rounded-lg">Зарегистрировать</button></div></div>`;
+        document.body.appendChild(modalDiv);
+        const closeModal = () => modalDiv.remove();
+        modalDiv.querySelector('.close-modal')?.addEventListener('click', closeModal);
+        modalDiv.querySelector('#cancel-register')?.addEventListener('click', closeModal);
+        modalDiv.querySelector('#submit-register')?.addEventListener('click', async () => {
+            const fullName = document.getElementById('reg-fullname').value.trim();
+            const username = document.getElementById('reg-username').value.trim();
+            const password = document.getElementById('reg-password').value;
+            const role = document.getElementById('reg-role').value;
+            if (!fullName || !username || !password) { showToast('Заполните все обязательные поля', 'error'); return; }
+            try { await apiCall('/auth/register', { method: 'POST', body: JSON.stringify({ username, password, full_name: fullName, role }) }); showToast('Пользователь успешно зарегистрирован', 'success'); closeModal(); } catch(e) { showToast(e.message, 'error'); }
+        });
+    }
+
+    function showToast(message, type = 'error') {
+        const toast = document.createElement('div');
+        toast.className = `fixed bottom-5 right-5 z-50 px-5 py-3 rounded-lg shadow-lg text-white ${type === 'error' ? 'bg-red-500' : type === 'success' ? 'bg-green-600' : 'bg-blue-500'} transition-all duration-300`;
+        toast.innerHTML = `<i class="fas ${type === 'error' ? 'fa-exclamation-circle' : type === 'success' ? 'fa-check-circle' : 'fa-info-circle'} mr-2"></i>${message}`;
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 4000);
+    }
+
+    function escapeHtml(str) { if(!str) return ''; return str.replace(/[&<>]/g, function(m){ if(m === '&') return '&amp;'; if(m === '<') return '&lt;'; if(m === '>') return '&gt;'; return m;}); }
+
+    async function fetchStatuses() { try { return await apiCall('/tickets/ticket-statuses'); } catch(e) { return ['new','in_progress','resolved']; } }
+
+    // ---------- Редактирование заявки с возможностью смены инвентаря и типа поломки ----------
+    async function showEditForm(ticket) {
+        let editableFields = { description: false, inventory_id: false, issue_type_id: false, is_urgent: false, resolution_note: false, inventory_status: false };
+        if (currentUser.role === 'superuser') {
+            editableFields = { description: true, inventory_id: true, issue_type_id: true, is_urgent: true, resolution_note: true, inventory_status: true };
+        } else if (currentUser.id === ticket.creator.id && ticket.status === 'new') {
+            editableFields.description = true;
+            editableFields.is_urgent = true;
+            editableFields.inventory_id = true;   // автор новой заявки может менять инвентарь
+            editableFields.issue_type_id = true;  // и тип поломки
+        } else if (currentUser.role === 'technician' && ticket.assignee?.id === currentUser.id && ticket.status === 'resolved') {
+            editableFields.resolution_note = true;
+            editableFields.inventory_status = true;
+        }
+        if (!Object.values(editableFields).some(v => v === true)) { showToast('У вас нет прав на редактирование этой заявки', 'error'); return; }
+
+        // Данные для динамической смены инвентаря
+        let selectedInventory = { ...ticket.inventory };          // текущий инвентарь
+        let currentIssueTypeId = ticket.issue_type.id;           // текущий тип поломки
+        let availableIssues = [];                                 // список доступных типов поломок для выбранного инвентаря
+
+        // Загрузка типов поломок для выбранного инвентаря
+        async function loadIssuesForInventory(inventory) {
+            if (!inventory || !inventory.type_id) { availableIssues = []; return; }
+            try { const issues = await apiCall(`/inventory-types/${inventory.type_id}/issues`); availableIssues = issues; } catch(e) { availableIssues = []; }
+        }
+        await loadIssuesForInventory(selectedInventory);
+
+        // Генерация модального окна с динамическими элементами
+        const modalDiv = document.createElement('div');
+        modalDiv.className = 'fixed inset-0 z-50 flex items-center justify-center modal-backdrop';
+        modalDiv.innerHTML = `
+            <div class="bg-white rounded-2xl w-full max-w-2xl mx-4 max-h-[85vh] overflow-y-auto shadow-2xl">
+                <div class="sticky top-0 bg-white border-b px-6 py-4 flex justify-between items-center">
+                    <h3 class="text-lg font-bold"><i class="fas fa-edit"></i> Редактирование заявки #${ticket.id}</h3>
+                    <button class="close-modal text-gray-500 hover:text-gray-800 text-2xl">&times;</button>
+                </div>
+                <div class="p-6 space-y-4">
+                    ${editableFields.description ? `<div class="edit-field-group"><label>Описание проблемы</label><textarea id="edit-description" rows="3">${escapeHtml(ticket.description)}</textarea></div>` : ''}
+                    ${editableFields.is_urgent ? `<div class="edit-field-group flex items-center gap-2"><input type="checkbox" id="edit-is-urgent" class="w-auto" ${ticket.is_urgent ? 'checked' : ''}><label>Срочная заявка</label></div>` : ''}
+                    ${editableFields.inventory_id ? `
+                        <div class="edit-field-group">
+                            <label>Номер инвентаря</label>
+                            <div class="flex gap-2"><input type="text" id="edit-inv-number" class="flex-1 border rounded-lg p-2" value="${escapeHtml(selectedInventory.inventory_number)}" placeholder="Например: PC-042"><button id="edit-fetch-inv-btn" class="bg-gray-700 hover:bg-gray-800 text-white px-4 rounded-lg"><i class="fas fa-search"></i> Проверить</button></div>
+                            <div id="edit-inv-info" class="inv-info mt-2"></div>
+                        </div>
+                        <div class="edit-field-group" id="edit-issues-section">
+                            <label>Тип неисправности</label>
+                            <select id="edit-issue-type-id" class="w-full border rounded-lg p-2"></select>
+                        </div>
+                    ` : ''}
+                    ${editableFields.issue_type_id && !editableFields.inventory_id ? `<div class="edit-field-group"><label>Тип неисправности (ID)</label><input type="number" id="edit-issue-type-id" value="${ticket.issue_type.id}"></div>` : ''}
+                    ${editableFields.resolution_note ? `<div class="edit-field-group"><label>Заметка о решении</label><textarea id="edit-resolution-note" rows="3">${escapeHtml(ticket.resolution_note || '')}</textarea></div>` : ''}
+                    ${editableFields.inventory_status ? `<div class="edit-field-group"><label>Новый статус инвентаря</label><select id="edit-inventory-status"><option value="">Не менять</option><option value="available" ${ticket.inventory.status === 'available' ? 'selected' : ''}>Доступен</option><option value="broken" ${ticket.inventory.status === 'broken' ? 'selected' : ''}>Сломан</option><option value="written_off" ${ticket.inventory.status === 'written_off' ? 'selected' : ''}>Списан</option></select></div>` : ''}
+                </div>
+                <div class="border-t p-4 flex justify-end gap-3"><button id="cancel-edit" class="px-4 py-2 bg-gray-200 rounded-lg">Отмена</button><button id="submit-edit" class="px-4 py-2 bg-blue-600 text-white rounded-lg">Сохранить</button></div>
+            </div>
+        `;
+        document.body.appendChild(modalDiv);
+        const closeModal = () => modalDiv.remove();
+        modalDiv.querySelector('.close-modal')?.addEventListener('click', closeModal);
+        modalDiv.querySelector('#cancel-edit')?.addEventListener('click', closeModal);
+
+        // Функция обновления информации об инвентаре и списка поломок
+        async function updateInventoryAndIssues() {
+            const invNumber = document.getElementById('edit-inv-number').value.trim();
+            const invInfoDiv = document.getElementById('edit-inv-info');
+            const issuesSection = document.getElementById('edit-issues-section');
+            const issueSelect = document.getElementById('edit-issue-type-id');
+            if (!invNumber) { invInfoDiv.innerHTML = '<div class="inv-info-error">Введите номер инвентаря</div>'; return false; }
+            try {
+                const inventory = await apiCall(`/inventory/${encodeURIComponent(invNumber)}`);
+                selectedInventory = inventory;
+                invInfoDiv.innerHTML = `<div class="inv-info-success"><i class="fas fa-check-circle"></i> Инвентарь: ${inventory.inventory_number} (${inventory.location}), статус: ${inventory.status}</div>`;
+                // загружаем типы поломок для этого типа инвентаря
+                const issues = await apiCall(`/inventory-types/${inventory.type_id}/issues`);
+                availableIssues = issues;
+                issueSelect.innerHTML = '<option value="">-- Выберите --</option>' + issues.map(issue => `<option value="${issue.id}">${escapeHtml(issue.name)}</option>`).join('');
+                // если текущий тип поломки всё ещё подходит, выберем его; иначе сбросим
+                if (availableIssues.some(i => i.id === currentIssueTypeId)) issueSelect.value = currentIssueTypeId;
+                else issueSelect.value = '';
+                return true;
+            } catch(e) {
+                invInfoDiv.innerHTML = `<div class="inv-info-error"><i class="fas fa-exclamation-triangle"></i> ${e.message}</div>`;
+                selectedInventory = null;
+                issueSelect.innerHTML = '<option value="">-- Выберите сначала инвентарь --</option>';
+                return false;
+            }
+        }
+
+        // Инициализация формы, если разрешено редактировать инвентарь
+        if (editableFields.inventory_id) {
+            const invNumberInput = document.getElementById('edit-inv-number');
+            const fetchBtn = document.getElementById('edit-fetch-inv-btn');
+            const invInfoDiv = document.getElementById('edit-inv-info');
+            const issueSelect = document.getElementById('edit-issue-type-id');
+            // Покажем информацию о текущем инвентаре и заполним select поломками
+            await (async () => {
+                const invNumber = invNumberInput.value.trim();
+                if (invNumber) {
+                    try {
+                        const inventory = await apiCall(`/inventory/${encodeURIComponent(invNumber)}`);
+                        selectedInventory = inventory;
+                        invInfoDiv.innerHTML = `<div class="inv-info-success"><i class="fas fa-check-circle"></i> Инвентарь: ${inventory.inventory_number} (${inventory.location}), статус: ${inventory.status}</div>`;
+                        const issues = await apiCall(`/inventory-types/${inventory.type_id}/issues`);
+                        availableIssues = issues;
+                        issueSelect.innerHTML = '<option value="">-- Выберите --</option>' + issues.map(issue => `<option value="${issue.id}">${escapeHtml(issue.name)}</option>`).join('');
+                        issueSelect.value = currentIssueTypeId;
+                    } catch(e) { invInfoDiv.innerHTML = `<div class="inv-info-error">Ошибка загрузки: ${e.message}</div>`; }
+                }
+            })();
+            fetchBtn.addEventListener('click', async () => { await updateInventoryAndIssues(); });
+        } else if (editableFields.issue_type_id) {
+            // если можно менять только тип поломки (без инвентаря) – простой input
+            const issueInput = document.getElementById('edit-issue-type-id');
+            // ничего дополнительного не требуется
+        }
+
+        // Сохранение изменений
+        modalDiv.querySelector('#submit-edit')?.addEventListener('click', async () => {
+            const updatePayload = {};
+            if (editableFields.description) {
+                const newDesc = document.getElementById('edit-description')?.value.trim();
+                if (newDesc && newDesc !== ticket.description) updatePayload.description = newDesc;
+            }
+            if (editableFields.is_urgent) {
+                const newUrgent = document.getElementById('edit-is-urgent')?.checked;
+                if (newUrgent !== ticket.is_urgent) updatePayload.is_urgent = newUrgent;
+            }
+            if (editableFields.resolution_note) {
+                const newNote = document.getElementById('edit-resolution-note')?.value.trim();
+                if (newNote !== (ticket.resolution_note || '')) updatePayload.resolution_note = newNote || null;
+            }
+            if (editableFields.inventory_status) {
+                const newInvStatus = document.getElementById('edit-inventory-status')?.value;
+                if (newInvStatus && newInvStatus !== ticket.inventory.status) updatePayload.inventory_status = newInvStatus;
+            }
+            if (editableFields.inventory_id && selectedInventory) {
+                if (selectedInventory.id !== ticket.inventory.id) updatePayload.inventory_id = selectedInventory.id;
+            }
+            if (editableFields.issue_type_id) {
+                let newIssueId = null;
+                if (editableFields.inventory_id) {
+                    const issueSelect = document.getElementById('edit-issue-type-id');
+                    newIssueId = parseInt(issueSelect.value);
+                } else {
+                    const issueInput = document.getElementById('edit-issue-type-id');
+                    newIssueId = parseInt(issueInput.value);
+                }
+                if (!isNaN(newIssueId) && newIssueId !== ticket.issue_type.id) updatePayload.issue_type_id = newIssueId;
+            }
+            if (Object.keys(updatePayload).length === 0) { showToast('Нет изменений', 'info'); closeModal(); return; }
+            try {
+                await apiCall(`/tickets/${ticket.id}`, { method: 'PATCH', body: JSON.stringify(updatePayload) });
+                showToast('Заявка обновлена', 'success');
+                closeModal();
+                refreshCurrentPage();
+            } catch (err) { showToast(err.message, 'error'); }
+        });
+    }
+
+    // ---------- Модальное окно просмотра заявки (с кнопкой редактирования) ----------
+    async function showTicketDetail(ticketId) {
+        try {
+            const ticket = await apiCall(`/tickets/${ticketId}`);
+            const isTechnicianOrSuper = currentUser?.role === 'technician' || currentUser?.role === 'superuser';
+            const isAssignee = ticket.assignee?.id === currentUser?.id;
+            const canAssign = isTechnicianOrSuper && ticket.status === 'new';
+            const canResolve = (isTechnicianOrSuper && (isAssignee || currentUser?.role === 'superuser')) && ticket.status === 'in_progress';
+            let canEdit = false;
+            if (currentUser.role === 'superuser') canEdit = true;
+            else if (currentUser.id === ticket.creator.id && ticket.status === 'new') canEdit = true;
+            else if (currentUser.role === 'technician' && ticket.assignee?.id === currentUser.id && ticket.status === 'resolved') canEdit = true;
+            
+            const modalDiv = document.createElement('div');
+            modalDiv.className = 'fixed inset-0 z-50 flex items-center justify-center modal-backdrop transition-all';
+            modalDiv.innerHTML = `<div class="bg-white rounded-2xl w-full max-w-2xl mx-4 max-h-[85vh] overflow-y-auto shadow-2xl"><div class="sticky top-0 bg-white border-b px-6 py-4 flex justify-between items-center"><h3 class="text-xl font-bold flex items-center gap-2"><i class="fas fa-ticket-alt text-blue-500"></i> Заявка #${ticket.id}${ticket.is_urgent ? '<span class="bg-red-100 text-red-700 text-xs px-2 py-1 rounded-full"><i class="fas fa-fire"></i> Срочно</span>' : ''}</h3><button class="close-modal text-gray-500 hover:text-gray-800 text-2xl leading-none">&times;</button></div><div class="p-6 space-y-4"><div class="grid grid-cols-1 md:grid-cols-2 gap-4"><div><span class="font-semibold">Статус:</span> <span class="px-2 py-1 rounded-full text-xs bg-${ticket.status === 'new' ? 'blue-100 text-blue-800' : ticket.status === 'in_progress' ? 'yellow-100 text-yellow-800' : 'green-100 text-green-800'}">${ticket.status}</span></div><div><span class="font-semibold">Создал:</span> ${escapeHtml(ticket.creator.full_name || ticket.creator.username)} (${ticket.creator.role})</div><div><span class="font-semibold">Исполнитель:</span> ${ticket.assignee ? escapeHtml(ticket.assignee.full_name || ticket.assignee.username) : 'не назначен'}</div><div><span class="font-semibold">Инвентарь:</span> ${escapeHtml(ticket.inventory.inventory_number)} (${escapeHtml(ticket.inventory.location)})</div><div><span class="font-semibold">Тип проблемы:</span> ${escapeHtml(ticket.issue_type.name)}</div><div><span class="font-semibold">Дата создания:</span> ${new Date(ticket.created_at).toLocaleString()}</div></div><div><span class="font-semibold">Описание:</span><br><div class="bg-gray-50 p-3 rounded-lg mt-1">${escapeHtml(ticket.description)}</div></div>${ticket.started_at ? `<div><span class="font-semibold">Начало работ:</span> ${new Date(ticket.started_at).toLocaleString()}</div>` : ''}${ticket.completed_at ? `<div><span class="font-semibold">Завершена:</span> ${new Date(ticket.completed_at).toLocaleString()}</div>` : ''}${ticket.resolution_note ? `<div><span class="font-semibold">Заметка о решении:</span> <div class="bg-gray-50 p-3 rounded-lg mt-1">${escapeHtml(ticket.resolution_note)}</div></div>` : ''}</div><div class="border-t p-4 flex justify-end gap-3">${canAssign ? `<button id="modal-assign-btn" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg flex items-center gap-2"><i class="fas fa-hand-paper"></i> Взять в работу</button>` : ''}${canResolve ? `<button id="modal-resolve-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg flex items-center gap-2"><i class="fas fa-check-circle"></i> Закрыть заявку</button>` : ''}${canEdit ? `<button id="modal-edit-btn" class="bg-yellow-600 hover:bg-yellow-700 text-white px-4 py-2 rounded-lg flex items-center gap-2"><i class="fas fa-edit"></i> Редактировать</button>` : ''}<button class="close-modal-btn bg-gray-300 hover:bg-gray-400 px-4 py-2 rounded-lg">Закрыть</button></div></div>`;
+            document.body.appendChild(modalDiv);
+            document.body.classList.add('modal-open');
+            const closeModal = () => { modalDiv.remove(); document.body.classList.remove('modal-open'); };
+            modalDiv.querySelector('.close-modal')?.addEventListener('click', closeModal);
+            modalDiv.querySelector('.close-modal-btn')?.addEventListener('click', closeModal);
+            modalDiv.addEventListener('click', (e) => { if(e.target === modalDiv) closeModal(); });
+            const assignBtn = modalDiv.querySelector('#modal-assign-btn');
+            if(assignBtn) assignBtn.addEventListener('click', async (e) => { e.stopPropagation(); try { await apiCall(`/tickets/${ticket.id}/assign`, { method: 'PATCH' }); showToast(`Заявка #${ticket.id} назначена на вас`, 'success'); closeModal(); await fetchNewTicketsCount(); refreshCurrentPage(); } catch(err) { showToast(err.message, 'error'); } });
+            const resolveBtn = modalDiv.querySelector('#modal-resolve-btn');
+            if(resolveBtn) resolveBtn.addEventListener('click', (e) => { e.stopPropagation(); closeModal(); showResolveForm(ticket.id); });
+            const editBtn = modalDiv.querySelector('#modal-edit-btn');
+            if(editBtn) editBtn.addEventListener('click', (e) => { e.stopPropagation(); closeModal(); showEditForm(ticket); });
+        } catch(e) { showToast(e.message, 'error'); }
+    }
+
+    function showResolveForm(ticketId) {
+        const modalDiv = document.createElement('div');
+        modalDiv.className = 'fixed inset-0 z-50 flex items-center justify-center modal-backdrop';
+        modalDiv.innerHTML = `<div class="bg-white rounded-2xl w-full max-w-md mx-4 shadow-2xl"><div class="border-b px-6 py-4 flex justify-between items-center"><h3 class="text-lg font-bold"><i class="fas fa-clipboard-list"></i> Закрытие заявки #${ticketId}</h3><button class="close-modal text-gray-500 hover:text-gray-800 text-2xl">&times;</button></div><div class="p-6 space-y-4"><div><label class="block font-medium mb-1">Заметка о решении *</label><textarea id="resolution-note" rows="3" class="w-full border rounded-lg p-2"></textarea></div><div><label class="block font-medium mb-1">Новый статус инвентаря</label><select id="inventory-status" class="w-full border rounded-lg p-2"><option value="">Не менять</option><option value="available">Доступен</option><option value="broken">Сломан</option><option value="written_off">Списан</option></select></div></div><div class="border-t p-4 flex justify-end gap-3"><button id="cancel-resolve" class="px-4 py-2 bg-gray-200 rounded-lg">Отмена</button><button id="submit-resolve" class="px-4 py-2 bg-blue-600 text-white rounded-lg">Подтвердить</button></div></div>`;
+        document.body.appendChild(modalDiv);
+        const closeModal = () => modalDiv.remove();
+        modalDiv.querySelector('.close-modal')?.addEventListener('click', closeModal);
+        modalDiv.querySelector('#cancel-resolve')?.addEventListener('click', closeModal);
+        modalDiv.querySelector('#submit-resolve')?.addEventListener('click', async () => {
+            const resolutionNote = document.getElementById('resolution-note').value.trim();
+            if(!resolutionNote) { showToast('Заметка о решении обязательна', 'error'); return; }
+            const inventoryStatus = document.getElementById('inventory-status').value;
+            const body = { resolution_note: resolutionNote };
+            if(inventoryStatus) body.inventory_status = inventoryStatus;
+            try { await apiCall(`/tickets/${ticketId}/resolve`, { method: 'PATCH', body: JSON.stringify(body) }); showToast('Заявка закрыта', 'success'); closeModal(); await fetchNewTicketsCount(); refreshCurrentPage(); } catch(err) { showToast(err.message, 'error'); }
+        });
+    }
+
+    function refreshCurrentPage() {
+        if (currentPageHandler === 'create') renderCreateTicket();
+        else if (currentPageHandler === 'my') renderMyTickets();
+        else if (currentPageHandler === 'new') renderNewTickets();
+        else if (currentPageHandler === 'assigned') renderAssignedTickets();
+        else if (currentPageHandler === 'inv-search') renderInventoryTickets();
+        else if (currentPageHandler === 'all') renderAllTickets();
+    }
+
+    function renderTicketList(tickets, containerId, showActions = false, assignable = false, resolveable = false) {
+        const container = document.getElementById(containerId);
+        if(!container) return;
+        if (!container.classList.contains('tickets-list-container')) container.classList.add('tickets-list-container');
+        if(!tickets.length) { container.innerHTML = '<div class="text-center py-8 text-gray-500">Нет заявок</div>'; return; }
+        container.innerHTML = tickets.map(t => `<div class="ticket-item bg-white rounded-xl p-4 shadow-sm border-l-4 ${t.is_urgent ? 'border-red-500' : 'border-blue-500'}" data-id="${t.id}"><div class="flex flex-wrap justify-between items-start gap-2"><div class="flex items-center gap-2 flex-wrap"><span class="font-bold text-gray-800">#${t.id}</span>${t.is_urgent ? '<span class="bg-red-100 text-red-700 text-xs px-2 py-0.5 rounded-full"><i class="fas fa-exclamation-circle"></i> Срочно</span>' : ''}<span class="text-xs px-2 py-1 rounded-full bg-${t.status === 'new' ? 'blue-100 text-blue-800' : t.status === 'in_progress' ? 'yellow-100 text-yellow-800' : 'green-100 text-green-800'}">${t.status}</span></div>${showActions ? `<div class="flex gap-2">${assignable && t.status === 'new' ? `<button class="assign-btn bg-green-500 hover:bg-green-600 text-white text-xs px-3 py-1 rounded-full" data-id="${t.id}"><i class="fas fa-hand-paper"></i> Взять</button>` : ''}${resolveable && t.status === 'in_progress' ? `<button class="resolve-btn bg-blue-500 hover:bg-blue-600 text-white text-xs px-3 py-1 rounded-full" data-id="${t.id}"><i class="fas fa-check"></i> Закрыть</button>` : ''}</div>` : ''}</div><div class="mt-2 text-gray-700 text-sm">${escapeHtml(t.description.substring(0, 100))}${t.description.length>100?'…':''}</div><div class="mt-2 text-xs text-gray-500 flex flex-wrap gap-x-4 gap-y-1"><span><i class="fas fa-box"></i> ${escapeHtml(t.inventory.inventory_number)}</span><span><i class="fas fa-tools"></i> ${escapeHtml(t.issue_type.name)}</span><span><i class="fas fa-user"></i> ${escapeHtml(t.creator.full_name || t.creator.username)}</span></div></div>`).join('');
+        document.querySelectorAll(`#${containerId} .ticket-item`).forEach(el => { el.addEventListener('click', (e) => { if(e.target.classList.contains('assign-btn') || e.target.classList.contains('resolve-btn')) return; showTicketDetail(parseInt(el.dataset.id)); }); });
+        if(showActions) {
+            document.querySelectorAll(`#${containerId} .assign-btn`).forEach(btn => { btn.addEventListener('click', async (e) => { e.stopPropagation(); const ticketId = parseInt(btn.dataset.id); try { await apiCall(`/tickets/${ticketId}/assign`, { method: 'PATCH' }); showToast(`Заявка #${ticketId} назначена`, 'success'); await fetchNewTicketsCount(); refreshCurrentPage(); } catch(err) { showToast(err.message, 'error'); } }); });
+            document.querySelectorAll(`#${containerId} .resolve-btn`).forEach(btn => { btn.addEventListener('click', (e) => { e.stopPropagation(); const ticketId = parseInt(btn.dataset.id); showResolveForm(ticketId); }); });
+        }
+    }
+
+    async function renderCreateTicket() {
+        currentPageHandler = 'create';
+        pageContent.innerHTML = `<div class="bg-white rounded-2xl shadow-md p-6"><h2 class="text-xl font-bold mb-4"><i class="fas fa-plus-circle"></i> Новая заявка</h2><div class="mb-4"><label class="block font-medium">Номер инвентаря *</label><div class="flex gap-2"><input type="text" id="inv-number" class="flex-1 border rounded-lg p-2" placeholder="Например: PC-042" /><button id="fetch-inv-btn" class="bg-gray-700 hover:bg-gray-800 text-white px-4 rounded-lg"><i class="fas fa-search"></i> Проверить</button></div></div><div id="inv-info" class="hidden p-3 rounded-lg mb-4"></div><div id="issues-section" class="hidden mb-4"><label class="block font-medium">Тип неисправности *</label><select id="issue-type-id" class="w-full border rounded-lg p-2"></select></div><div class="mb-4"><label class="block font-medium">Описание проблемы *</label><textarea id="ticket-desc" rows="3" class="w-full border rounded-lg p-2"></textarea></div><div class="mb-4 flex items-center gap-2"><input type="checkbox" id="is-urgent" class="w-auto" /> <label class="font-medium">Срочная заявка</label></div><button id="submit-ticket-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg disabled:opacity-50" disabled>Создать заявку</button></div>`;
+        let selectedInventory = null;
+        const invInput = document.getElementById('inv-number');
+        const fetchBtn = document.getElementById('fetch-inv-btn');
+        const invInfoDiv = document.getElementById('inv-info');
+        const issuesSection = document.getElementById('issues-section');
+        const issueSelect = document.getElementById('issue-type-id');
+        const submitBtn = document.getElementById('submit-ticket-btn');
+        fetchBtn.onclick = async () => {
+            const invNumber = invInput.value.trim();
+            if(!invNumber) return showToast('Введите номер инвентаря', 'error');
+            try {
+                const inventory = await apiCall(`/inventory/${encodeURIComponent(invNumber)}`);
+                selectedInventory = inventory;
+                invInfoDiv.innerHTML = `<i class="fas fa-check-circle text-green-600"></i> Инвентарь: ${inventory.inventory_number} (${inventory.location}), статус: ${inventory.status}`;
+                invInfoDiv.className = "p-3 bg-green-50 text-green-800 rounded-lg mb-4";
+                const issues = await apiCall(`/inventory-types/${inventory.type_id}/issues`);
+                issueSelect.innerHTML = '<option value="">-- Выберите --</option>' + issues.map(issue => `<option value="${issue.id}">${escapeHtml(issue.name)}</option>`).join('');
+                issuesSection.classList.remove('hidden');
+                validateForm();
+            } catch(e) { invInfoDiv.innerHTML = `<i class="fas fa-exclamation-triangle"></i> ${e.message}`; invInfoDiv.className = "p-3 bg-red-50 text-red-800 rounded-lg mb-4"; selectedInventory=null; issuesSection.classList.add('hidden'); validateForm(); }
+        };
+        function validateForm() { const desc = document.getElementById('ticket-desc')?.value.trim(); const issue = issueSelect?.value; submitBtn.disabled = !(selectedInventory && desc && issue); }
+        document.getElementById('ticket-desc')?.addEventListener('input', validateForm);
+        issueSelect?.addEventListener('change', validateForm);
+        submitBtn.onclick = async () => {
+            const desc = document.getElementById('ticket-desc').value.trim();
+            const issueId = parseInt(issueSelect.value);
+            const isUrgent = document.getElementById('is-urgent').checked;
+            try {
+                await apiCall('/tickets/', { method: 'POST', body: JSON.stringify({ description: desc, inventory_id: selectedInventory.id, issue_type_id: issueId, is_urgent: isUrgent }) });
+                showToast('Заявка создана', 'success');
+                await fetchNewTicketsCount();
+                if(currentUser.role === 'employee') renderMyTickets(); else renderNewTickets();
+            } catch(e) { showToast(e.message, 'error'); }
+        };
+    }
+
+    async function renderMyTickets() { currentPageHandler = 'my'; pageContent.innerHTML = `<div class="bg-white rounded-2xl shadow-md p-6"><h2 class="text-xl font-bold mb-4"><i class="fas fa-user"></i> Мои заявки</h2><div id="my-tickets-list" class="tickets-list-container"></div></div>`; try { const tickets = await apiCall('/tickets/my'); renderTicketList(tickets, 'my-tickets-list', false); } catch(e) { document.getElementById('my-tickets-list').innerHTML = `<div class="text-red-500">${e.message}</div>`; } }
+    async function renderNewTickets() { currentPageHandler = 'new'; pageContent.innerHTML = `<div class="bg-white rounded-2xl shadow-md p-6"><h2 class="text-xl font-bold mb-4"><i class="fas fa-inbox"></i> Новые заявки</h2><div id="new-tickets-list" class="tickets-list-container"></div></div>`; try { const tickets = await apiCall('/tickets/new'); renderTicketList(tickets, 'new-tickets-list', true, true, false); } catch(e) { document.getElementById('new-tickets-list').innerHTML = `<div class="text-red-500">${e.message}</div>`; } }
+    async function renderAssignedTickets() { currentPageHandler = 'assigned'; const statuses = await fetchStatuses(); pageContent.innerHTML = `<div class="bg-white rounded-2xl shadow-md p-6"><h2 class="text-xl font-bold mb-4"><i class="fas fa-tasks"></i> Мои назначенные заявки</h2><div class="mb-4"><select id="status-filter-assigned" class="border rounded-lg p-2"><option value="">Все статусы</option>${statuses.map(s => `<option value="${s}">${s}</option>`).join('')}</select></div><div id="assigned-tickets-list" class="tickets-list-container"></div></div>`; const filterSelect = document.getElementById('status-filter-assigned'); const load = async () => { const filter = filterSelect.value; let url = '/tickets/assigned'; if(filter) url += `?ticket_status=${filter}`; try { const tickets = await apiCall(url); renderTicketList(tickets, 'assigned-tickets-list', true, false, true); } catch(e) { document.getElementById('assigned-tickets-list').innerHTML = `<div class="text-red-500">${e.message}</div>`; } }; filterSelect.addEventListener('change', load); load(); }
+    async function renderInventoryTickets() { currentPageHandler = 'inv-search'; pageContent.innerHTML = `<div class="bg-white rounded-2xl shadow-md p-6"><h2 class="text-xl font-bold mb-4"><i class="fas fa-search"></i> Заявки по инвентарю</h2><div class="flex gap-2 mb-4"><input id="search-inv-number" class="flex-1 border rounded-lg p-2" placeholder="Номер инвентаря" /><button id="search-inv-tickets" class="bg-blue-600 text-white px-4 rounded-lg">Искать</button></div><div id="inv-tickets-result" class="tickets-list-container"></div></div>`; document.getElementById('search-inv-tickets').onclick = async () => { const invNum = document.getElementById('search-inv-number').value.trim(); if(!invNum) return; try { const tickets = await apiCall(`/inventory/${encodeURIComponent(invNum)}/tickets`); renderTicketList(tickets, 'inv-tickets-result', true, true, true); } catch(e) { document.getElementById('inv-tickets-result').innerHTML = `<div class="text-red-500">${e.message}</div>`; }; }; }
+    async function renderAllTickets() { currentPageHandler = 'all'; pageContent.innerHTML = `<div class="bg-white rounded-2xl shadow-md p-6"><h2 class="text-xl font-bold mb-4"><i class="fas fa-list"></i> Все заявки</h2><div id="all-tickets-list" class="tickets-list-container"></div></div>`; try { const tickets = await apiCall('/tickets/'); renderTicketList(tickets, 'all-tickets-list', true, true, true); } catch(e) { document.getElementById('all-tickets-list').innerHTML = `<div class="text-red-500">${e.message}</div>`; } }
+
+    function buildNavTabs() {
+        navTabsDiv.innerHTML = '';
+        const tabs = [{ id: 'create', label: '➕ Создать заявку', handler: renderCreateTicket }];
+        tabs.push({ id: 'my', label: '📋 Мои заявки', handler: renderMyTickets });
+        if (currentUser?.role === 'technician' || currentUser?.role === 'superuser') {
+            tabs.push({ id: 'new', label: '🆕 Новые заявки', handler: renderNewTickets });
+            tabs.push({ id: 'assigned', label: '📌 Мои назначенные', handler: renderAssignedTickets });
+            tabs.push({ id: 'inv-search', label: '🔍 Поиск по инвентарю', handler: renderInventoryTickets });
+        }
+        if (currentUser?.role === 'superuser') tabs.push({ id: 'all', label: '📋 Все заявки', handler: renderAllTickets });
+        tabs.forEach(tab => { const btn = document.createElement('button'); btn.innerHTML = tab.label; btn.className = 'tab-btn px-4 py-2 rounded-full font-medium transition bg-gray-200 text-gray-800 hover:bg-gray-300'; btn.setAttribute('data-tab', tab.id); btn.onclick = () => { document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('bg-blue-600', 'text-white', 'bg-gray-200')); btn.classList.add('bg-blue-600', 'text-white'); tab.handler(); }; navTabsDiv.appendChild(btn); });
+        if(tabs.length) tabs[0].handler();
+        fetchNewTicketsCount();
+        connectWebSocket();
+    }
+
+    async function loadCurrentUser() {
+        try {
+            const user = await apiCall('/auth/me');
+            currentUser = user;
+            const displayName = user.full_name || user.username;
+            userInfoSpan.innerHTML = `<i class="fas fa-user-circle"></i> ${escapeHtml(displayName)} <span class="text-xs bg-gray-200 px-2 py-1 rounded-full">${user.role}</span>`;
+            authSection.classList.add('hidden');
+            appContent.classList.remove('hidden');
+            const registerBtn = document.getElementById('register-user-btn');
+            if (registerBtn) { if (user.role === 'superuser') registerBtn.classList.remove('hidden'); else registerBtn.classList.add('hidden'); }
+            buildNavTabs();
+        } catch(e) {
+            currentUser = null;
+            authSection.classList.remove('hidden');
+            appContent.classList.add('hidden');
+            renderAuthForms();
+        }
+    }
+
+    function renderAuthForms() {
+        authSection.innerHTML = `<div class="max-w-md mx-auto"><h3 class="text-xl font-bold mb-4 text-center"><i class="fas fa-sign-in-alt"></i> Вход в систему</h3><input id="login-username" class="w-full border rounded-lg p-2 mb-3" placeholder="Логин"><input id="login-password" type="password" class="w-full border rounded-lg p-2 mb-3" placeholder="Пароль"><button id="login-btn" class="w-full bg-blue-600 text-white py-2 rounded-lg">Войти</button><div id="auth-message" class="mt-4"></div></div>`;
+        document.getElementById('login-btn').onclick = async () => { const username = document.getElementById('login-username').value; const password = document.getElementById('login-password').value; try { await apiCall('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }); await loadCurrentUser(); } catch(e) { showToast(e.message, 'error'); } };
+    }
+
+    const authSection = document.getElementById('auth-section');
+    const appContent = document.getElementById('app-content');
+    const userInfoSpan = document.getElementById('user-info');
+    const logoutBtn = document.getElementById('logout-btn');
+    const registerUserBtn = document.getElementById('register-user-btn');
+    const navTabsDiv = document.getElementById('nav-tabs');
+    const pageContent = document.getElementById('page-content');
+
+    if (logoutBtn) logoutBtn.onclick = async () => { disconnectWebSocket(); await apiCall('/auth/logout'); currentUser = null; authSection.classList.remove('hidden'); appContent.classList.add('hidden'); renderAuthForms(); };
+    if (registerUserBtn) registerUserBtn.onclick = () => { showRegisterModal(); };
+    loadCurrentUser();
+</script>
+</body>
+</html>
